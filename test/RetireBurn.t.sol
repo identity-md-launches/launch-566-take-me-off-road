@@ -84,6 +84,7 @@ contract RetireBurnTest is Test, FareDeploy {
         assertEq(hook.anchorTick(), 0);
         assertEq(hook.lastRefTick(), 0);
         assertEq(hook.lastBurnBlock(), 100);
+        assertEq(hook.lastReferenceBlock(), 100);
     }
 
     function test_constructorSeedsClosedOracle() public {
@@ -92,6 +93,7 @@ contract RetireBurnTest is Test, FareDeploy {
         assertTrue(other.pool4Seen());
         assertEq(other.anchorTick(), 875);
         assertEq(other.lastRefTick(), 875);
+        assertEq(other.lastReferenceBlock(), block.number);
     }
 
     function test_retireBelowCapReverts() public {
@@ -535,6 +537,154 @@ contract RetireBurnTest is Test, FareDeploy {
         vm.roll(block.number + 50_400);
         hook.burnIMD(true, 0);
         assertEq(hook.burnSpent(), 0.1 ether);
+    }
+
+    function _assertStaleLiveRecovery(int24 tick, uint256 quotedOutput, bool viaPool4) internal {
+        _ready();
+        hook.burnIMD(true, 0);
+        vm.roll(block.number + hook.STALE_AFTER_BLOCKS() + 1);
+        oracle.configure(true, tick, 0);
+        manager.setTick(pool4Key, tick);
+        manager.setTick(plainKey, tick);
+        vm.expectRevert(MedallionHook.Pool4Unavailable.selector);
+        hook.burnIMD(true, 0);
+
+        vm.prank(address(0xCA11));
+        hook.pokeAnchor();
+        assertEq(hook.lastRefTick(), tick);
+        assertEq(hook.anchorTick(), tick);
+        assertEq(hook.lastReferenceBlock(), block.number);
+        assertEq(hook.lastBurnBlock(), 105);
+        // Fill at the new market quote, including downward moves outside the old fallback band.
+        manager.setOutput(10_000, quotedOutput);
+        hook.burnIMD(viaPool4, 0);
+        assertEq(hook.burnSpent(), 0.1 ether);
+        assertEq(hook.burnable(), 0.9 ether);
+        assertEq(imd.balanceOf(DEAD), 0.05 ether + quotedOutput);
+        assertEq(PoolId.unwrap(manager.lastPoolId()), PoolId.unwrap(viaPool4 ? pool4Key.toId() : plainKey.toId()));
+        _assertLedger();
+    }
+
+    function test_staleLivePokeRecoversPool4AfterLargeDownwardMove() public {
+        // floor(0.05 ether * 1.0001**-1500), independently calculated decimal quote.
+        _assertStaleLiveRecovery(-1500, 43_035_721_566_438_176, true);
+    }
+
+    function test_staleLivePokeRecoversPlainAfterLargeDownwardMove() public {
+        _assertStaleLiveRecovery(-1500, 43_035_721_566_438_176, false);
+    }
+
+    function test_staleLivePokeRecoversPool4AfterLargeUpwardMove() public {
+        // floor(0.05 ether * 1.0001**1500), independently calculated decimal quote.
+        _assertStaleLiveRecovery(1500, 58_091_276_479_250_418, true);
+    }
+
+    function test_staleLivePokeRecoversPlainAfterLargeUpwardMove() public {
+        _assertStaleLiveRecovery(1500, 58_091_276_479_250_418, false);
+    }
+
+    function test_staleLivePokeRecoversWithoutInitializedPlainPool() public {
+        manager = new FareManagerMock();
+        hook = _deployHook(IPoolManager(address(manager)));
+        launchKey.hooks = IHooks(address(hook));
+        manager.initializeHook(IHooks(address(hook)), launchKey);
+        manager.setTick(pool4Key, 0);
+        imd.mint(address(manager), 1 ether);
+        _ready();
+        hook.burnIMD(true, 0);
+        vm.roll(block.number + hook.STALE_AFTER_BLOCKS() + 1);
+        vm.expectRevert(MedallionHook.PoolUnavailable.selector);
+        hook.burnIMD(false, 0);
+
+        oracle.configure(true, -1500, 0);
+        manager.setTick(pool4Key, -1500);
+        hook.pokeAnchor();
+        manager.setOutput(10_000, 43_035_721_566_438_176);
+        hook.burnIMD(true, 0);
+        assertEq(hook.burnSpent(), 0.1 ether);
+        assertEq(hook.lastRefTick(), -1500);
+        assertEq(hook.lastReferenceBlock(), block.number);
+        _assertLedger();
+    }
+
+    function test_livePokeDoesNotSpendFeesOrResetBurnCooldown() public {
+        _ready();
+        hook.burnIMD(true, 0);
+        uint256 burnedAt = hook.lastBurnBlock();
+        uint256 claims = manager.balanceOf(address(hook), 0);
+        uint256 burnedIMD = hook.totalIMDBurned();
+        vm.roll(burnedAt + 4);
+        hook.pokeAnchor();
+        assertEq(hook.lastBurnBlock(), burnedAt);
+        assertEq(hook.lastReferenceBlock(), block.number);
+        assertEq(hook.burnSpent(), 0.05 ether);
+        assertEq(hook.totalIMDBurned(), burnedIMD);
+        assertEq(manager.balanceOf(address(hook), 0), claims);
+        assertEq(manager.unlockCount(), 1);
+        vm.expectRevert(MedallionHook.TooSoon.selector);
+        hook.burnIMD(true, 0);
+        vm.roll(burnedAt + 5);
+        hook.burnIMD(true, 0);
+        assertEq(hook.burnSpent(), 0.1 ether);
+        _assertLedger();
+    }
+
+    function _assertFallbackPokesCannotRefreshOracle(bool malformed) internal {
+        _ready();
+        hook.burnIMD(true, 0);
+        uint256 originalReferenceBlock = hook.lastReferenceBlock();
+        vm.roll(block.number + hook.STALE_AFTER_BLOCKS() + 1);
+        oracle.configure(malformed, 5000, malformed ? 2 : 0);
+        manager.setTick(plainKey, 5000);
+        for (uint256 i; i < 6; ++i) {
+            hook.pokeAnchor();
+            vm.roll(block.number + 1);
+        }
+        assertEq(hook.lastRefTick(), 0);
+        assertEq(hook.anchorTick(), 1000);
+        assertEq(hook.burnSpent(), 0.05 ether);
+        assertEq(hook.lastReferenceBlock(), originalReferenceBlock);
+        // Becoming readable/open is insufficient: a fresh validated seed or burn is still required.
+        oracle.configure(true, 5000, 0);
+        vm.expectRevert(MedallionHook.Pool4Unavailable.selector);
+        hook.burnIMD(true, 0);
+        _assertLedger();
+    }
+
+    function test_staleClosedOracleFallbackPokesCannotRefreshFreshness() public {
+        _assertFallbackPokesCannotRefreshOracle(false);
+    }
+
+    function test_staleMalformedOracleFallbackPokesCannotRefreshFreshness() public {
+        _assertFallbackPokesCannotRefreshOracle(true);
+    }
+
+    function _pokeAfterStaleBurn() internal returns (uint256 seededAt) {
+        _ready();
+        hook.burnIMD(true, 0);
+        vm.roll(block.number + hook.STALE_AFTER_BLOCKS() + 1);
+        hook.pokeAnchor();
+        seededAt = block.number;
+        assertEq(hook.lastReferenceBlock(), seededAt);
+        assertEq(hook.lastBurnBlock(), 105);
+    }
+
+    function test_liveSeedFreshnessBoundaryIsInclusive() public {
+        uint256 seededAt = _pokeAfterStaleBurn();
+        vm.roll(seededAt + hook.STALE_AFTER_BLOCKS());
+        hook.burnIMD(true, 0);
+        assertEq(hook.burnSpent(), 0.1 ether);
+        assertEq(hook.lastReferenceBlock(), block.number);
+    }
+
+    function test_liveSeedFreshnessExpiresBackToFallback() public {
+        uint256 seededAt = _pokeAfterStaleBurn();
+        vm.roll(seededAt + hook.STALE_AFTER_BLOCKS() + 1);
+        vm.expectRevert(MedallionHook.Pool4Unavailable.selector);
+        hook.burnIMD(true, 0);
+        hook.burnIMD(false, 0);
+        assertEq(hook.burnSpent(), 0.06 ether);
+        assertEq(hook.lastReferenceBlock(), seededAt);
     }
 
     function test_fallbackBurnUsesStartOfBlockAnchorAfterPoke() public {

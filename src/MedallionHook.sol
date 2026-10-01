@@ -65,6 +65,7 @@ contract MedallionHook is IUnlockCallback {
     uint256 public anchorBlock;
     int24 public startOfBlockAnchor;
     uint256 private snapshotBlock;
+    uint256 public lastReferenceBlock;
 
     error Unauthorized();
     error Reentrant();
@@ -118,6 +119,7 @@ contract MedallionHook is IUnlockCallback {
             startOfBlockAnchor = ref;
             anchorBlock = block.number;
             snapshotBlock = block.number;
+            lastReferenceBlock = block.number;
         }
     }
 
@@ -234,11 +236,11 @@ contract MedallionHook is IUnlockCallback {
         emit IMDBurned(amount, imdOut, viaPool4);
     }
 
-    /// @notice Refresh the ref or advance the fallback anchor by at most one step this block.
+    /// @notice Refresh from open POOL4 even after idle periods, or advance the fallback anchor once this block.
     function pokeAnchor() external nonReentrant {
         if (block.chainid != 1) revert WrongChain();
-        (bool normal, int24 ref) = _normalReference();
-        if (normal) {
+        (bool available, bool open, int24 ref) = _readPool4();
+        if (available && open) {
             _seedAnchor(ref);
         } else {
             if (!pool4Seen) revert Pool4Unavailable();
@@ -367,7 +369,9 @@ contract MedallionHook is IUnlockCallback {
 
     function _normalReference() private view returns (bool normal, int24 ref) {
         (bool available, bool open, int24 tick) = _readPool4();
-        normal = available && open && (burnSpent == 0 || block.number - lastBurnBlock <= STALE_AFTER_BLOCKS);
+        // An explicit live reference refresh restores freshness without resetting the burn cooldown.
+        uint256 freshBlock = lastBurnBlock > lastReferenceBlock ? lastBurnBlock : lastReferenceBlock;
+        normal = available && open && (burnSpent == 0 || block.number - freshBlock <= STALE_AFTER_BLOCKS);
         ref = tick;
     }
 
@@ -409,6 +413,7 @@ contract MedallionHook is IUnlockCallback {
         anchorTick = ref;
         lastRefTick = ref;
         anchorBlock = block.number;
+        lastReferenceBlock = block.number;
         emit AnchorUpdated(anchorTick, lastRefTick, true);
     }
 
