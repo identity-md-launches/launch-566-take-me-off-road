@@ -47,6 +47,9 @@ contract MedallionLifecycleHandler is Test {
     uint256 public ghostSpent;
     uint256 public ghostIMD;
     uint256 public ghostLastBurn;
+    /// @dev Block of the last live POOL4 seed: constructor, a normal-mode burn, or a poke while the market is open.
+    uint256 public ghostLastReference;
+    bool public ghostOracleLive = true;
     uint256 public recoupedEvents;
     bool public ghostRetired;
     uint256 public trades;
@@ -57,6 +60,7 @@ contract MedallionLifecycleHandler is Test {
 
     struct BurnState {
         uint256 batch;
+        bool normal;
         bool tooSoon;
         address actor;
         uint256 actorETH;
@@ -74,6 +78,7 @@ contract MedallionLifecycleHandler is Test {
         oracle = FarePool4Mock(h.POOL4_HOOK());
         receiver = FareReceiverMock(payable(h.CREATOR()));
         ghostLastBurn = block.number;
+        ghostLastReference = block.number;
         actors = [address(0xA447), address(0xB447), address(0xC447)];
     }
 
@@ -138,11 +143,14 @@ contract MedallionLifecycleHandler is Test {
         vm.roll(vm.getBlockNumber() + advance);
         oracleMode %= 3;
         oracle.configure(oracleMode == 0, 0, oracleMode == 2 ? 1 : 0);
+        ghostOracleLive = oracleMode == 0;
         BurnState memory s;
         {
-            bool normal = oracleMode == 0 && (ghostSpent == 0 || vm.getBlockNumber() - ghostLastBurn <= 50_400);
+            // Freshness is measured from the later of the last burn and the last live reference seed.
+            uint256 fresh = ghostLastBurn > ghostLastReference ? ghostLastBurn : ghostLastReference;
+            s.normal = oracleMode == 0 && (ghostSpent == 0 || vm.getBlockNumber() - fresh <= 50_400);
             uint256 budget = ghostFees > CAP ? ghostFees - CAP - ghostSpent : 0;
-            s.batch = normal ? 0.05 ether : 0.01 ether;
+            s.batch = s.normal ? 0.05 ether : 0.01 ether;
             if (s.batch > budget) s.batch = budget;
         }
         s.tooSoon = vm.getBlockNumber() - ghostLastBurn < 5;
@@ -171,6 +179,7 @@ contract MedallionLifecycleHandler is Test {
             ghostSpent += s.batch;
             ghostIMD += received;
             ghostLastBurn = vm.getBlockNumber();
+            if (s.normal) ghostLastReference = vm.getBlockNumber();
             ++burns;
         } else {
             ++rejectedBurns;
@@ -187,6 +196,8 @@ contract MedallionLifecycleHandler is Test {
     function poke(uint8 actorSeed) external {
         vm.prank(actors[actorSeed % 3]);
         hook.pokeAnchor();
+        // A poke while POOL4 is open re-seeds the live reference, which restores normal mode after idling.
+        if (ghostOracleLive) ghostLastReference = vm.getBlockNumber();
     }
 
     function partialSwap(bool buy, uint8 actorSeed) external {
@@ -330,6 +341,7 @@ contract MedallionLifecycleInvariantTest is Test, FareDeploy {
         assertEq(hook.totalIMDBurned(), handler.ghostIMD());
         assertEq(FareToken(IMD).balanceOf(DEAD), handler.ghostIMD());
         assertEq(hook.lastBurnBlock(), handler.ghostLastBurn());
+        assertEq(hook.lastReferenceBlock(), handler.ghostLastReference());
         assertEq(address(hook).balance, 0);
         assertEq(FareToken(IMD).balanceOf(address(hook)), 0);
     }
@@ -358,7 +370,10 @@ contract MedallionLifecycleInvariantTest is Test, FareDeploy {
         handler.attemptRetire(true, false, 0);
         handler.burn(0, 0, false, 0);
         handler.burn(0, 7, false, 1);
+        assertEq(hook.burnSpent(), 0.06 ether, "the stale burn spent the fallback batch");
         handler.poke(1);
+        handler.burn(0, 5, false, 0);
+        assertEq(hook.burnSpent(), 0.11 ether, "a live poke restored the normal batch");
         handler.trade(1 ether, 1, 1);
         handler.trade(1 ether, 2, 2);
         handler.trade(1 ether, 3, 0);
@@ -369,7 +384,7 @@ contract MedallionLifecycleInvariantTest is Test, FareDeploy {
         invariant_retirementAndBurnsReachOnlyFixedRecipients();
         invariant_everyUnlockSettlesAllCurrencyDeltas();
         assertEq(handler.trades(), 6);
-        assertEq(handler.burns(), 2);
+        assertEq(handler.burns(), 3);
         assertEq(handler.rejectedBurns(), 2);
         assertEq(handler.rejectedRetirements(), 4);
         assertEq(handler.rejectedSwaps(), 2);
