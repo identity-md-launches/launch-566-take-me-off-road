@@ -1,0 +1,27 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "MedallionHook",
+    "constructorArgs": ["$poolManager"],
+    "permissions": [
+      "afterInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "FareToken",
+    "name": "Fare for Medallion 447",
+    "symbol": "FARE447",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "The petition is fiction by the owner. CREATOR is intentionally the requester's wallet, 0x70c6C4fcaAb11151FCEDb32eaaC3431547193A0a, and receives exactly 1.64 ETH only in the transaction that retires medallion #447 to DEAD. There is no admin or beneficiary setter. Hook permissions are 0x10CC. Deploy with the chain's PoolManager as the sole argument and atomically initialize the intended native-ETH pool, because the first such pool permanently becomes launchPool. Initial price is the decimal sqrtPriceX96 2**96, assuming one FARE447 per ETH. MEDALLION_NFT, IMD and POOL4 addresses are fixed mainnet constants: retirement and IMD burns revert on Sepolia. The NFT's current owner must approve the hook unless the NFT is already at DEAD. Fees accrue as PoolManager claims; permissionless retirement and bounded IMD purchases require separate top-level transactions. Callers receive no reward. Donations do not enter the ledger. See README.md and docs/operations.md for accounting, reference-price guards, keeper responsibilities, and deployment assumptions."
+}
